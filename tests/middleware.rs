@@ -67,6 +67,7 @@ async fn collect_fold(
         first,
         Some(Arc::new(IdStore::default())),
         opener,
+        None,
     );
     futures_util::pin_mut!(folded);
     let mut out = Vec::new();

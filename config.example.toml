@@ -34,5 +34,5 @@ rechunk_final_answer = true
 rechunk_size = 16
 
 [log]
-level = "info"
+level = "info" # off | error | warn | info | debug
 dump_rounds_dir = ""

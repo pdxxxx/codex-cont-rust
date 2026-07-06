@@ -19,6 +19,7 @@ use crate::{
         reasoning_tokens, should_continue, tier_n,
     },
     config::Config,
+    logging,
     sse::{incremental_sse, serialize_done, serialize_event, SseItem},
     store::IdStore,
 };
@@ -73,14 +74,14 @@ async fn send_body(
     for (name, value) in headers {
         req = req.header(name.as_str(), value.as_str());
     }
-    let resp = req.send().await.map_err(|e| e.to_string())?;
+    let resp = req.send().await.map_err(|e| e.without_url().to_string())?;
     let status = resp.status().as_u16();
     let content_type = resp
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let body = Box::pin(resp.bytes_stream().map(|r| r.map_err(|e| e.to_string())));
+    let body = Box::pin(resp.bytes_stream().map(|r| r.map_err(|e| e.without_url().to_string())));
     Ok(UpstreamResponse {
         status,
         content_type,
@@ -113,6 +114,7 @@ pub fn fold_stream(
     first_response: UpstreamResponse,
     id_store: Arc<IdStore>,
     url: String,
+    request_id: u64,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> + Send {
     let opener: OpenNext = Box::new(move |payload| {
         let client = client.clone();
@@ -120,7 +122,7 @@ pub fn fold_stream(
         let url = url.clone();
         Box::pin(async move { open_round(&client, &url, &payload, &headers).await })
     });
-    fold_stream_with_opener(cfg, base_body, first_response, Some(id_store), opener)
+    fold_stream_with_opener(cfg, base_body, first_response, Some(id_store), opener, Some(request_id))
         .map(Ok::<Bytes, Infallible>)
 }
 
@@ -130,8 +132,10 @@ pub fn fold_stream_with_opener(
     first_response: UpstreamResponse,
     id_store: Option<Arc<IdStore>>,
     mut opener: OpenNext,
+    request_id: Option<u64>,
 ) -> impl Stream<Item = Bytes> + Send {
     stream! {
+        let rid = request_id.map(|id| format!("request_id={id} ")).unwrap_or_default();
         let cont = cfg.cont.clone();
         let orig_input = array_clone(base_body.get("input"));
         let mut seq = Seq::default();
@@ -158,7 +162,9 @@ pub fn fold_stream_with_opener(
             let body = if cfg.log.dump_rounds_dir.is_empty() {
                 body
             } else {
-                tee_stream(body, PathBuf::from(&cfg.log.dump_rounds_dir).join(format!("codex_mw_r{round_no}.sse.txt")))
+                let path = PathBuf::from(&cfg.log.dump_rounds_dir).join(format!("codex_mw_r{round_no}.sse.txt"));
+                logging::debug(cfg.as_ref(), format!("{rid}round={round_no} dump={}", path.display()));
+                tee_stream(body, path)
             };
             let events = incremental_sse(body);
             futures_util::pin_mut!(events);
@@ -248,6 +254,7 @@ pub fn fold_stream_with_opener(
             }
 
             if stream_error {
+                logging::error(cfg.as_ref(), format!("{rid}upstream_error round={round_no}"));
                 yield serialize_event(&synthetic_incomplete(
                     base_response.as_ref(),
                     &final_output,
@@ -280,6 +287,14 @@ pub fn fold_stream_with_opener(
                 && has_enc
                 && round_no <= cont.max_continue
                 && within_caps;
+            logging::info(
+                cfg.as_ref(),
+                format!(
+                    "{rid}round={round_no} reasoning_tokens={} n={} continue={do_continue}",
+                    opt_i64(rt),
+                    opt_i64(n)
+                ),
+            );
 
             let stopped_reason = if !do_continue && is_truncation_pattern(rt, cont.truncation_step) {
                 Some(if !has_enc {
@@ -296,6 +311,7 @@ pub fn fold_stream_with_opener(
             };
 
             if do_continue {
+                logging::info(cfg.as_ref(), format!("{rid}continue next_round={}", round_no + 1));
                 let last_id = round_reasoning
                     .last()
                     .and_then(|r| r.get("id"))
@@ -348,10 +364,18 @@ pub fn fold_stream_with_opener(
                 );
                 match opener(payload).await {
                     Ok(next) if next.status < 400 => {
+                        logging::info(
+                            cfg.as_ref(),
+                            format!("{rid}upstream status={} round={}", next.status, round_no + 1),
+                        );
                         response = next;
                         continue;
                     }
                     Ok(next) => {
+                        logging::error(
+                            cfg.as_ref(),
+                            format!("{rid}upstream_error status={} round={}", next.status, round_no + 1),
+                        );
                         let _ = collect_body(next, Some(2000)).await;
                         yield serialize_event(&synthetic_incomplete(
                             base_response.as_ref(),
@@ -364,7 +388,11 @@ pub fn fold_stream_with_opener(
                         ));
                         return;
                     }
-                    Err(_) => {
+                    Err(err) => {
+                        logging::error(
+                            cfg.as_ref(),
+                            format!("{rid}upstream open failed round={}: {err}", round_no + 1),
+                        );
                         yield serialize_event(&synthetic_incomplete(
                             base_response.as_ref(),
                             &final_output,
@@ -380,6 +408,7 @@ pub fn fold_stream_with_opener(
             }
 
             if !saw_terminal {
+                logging::warn(cfg.as_ref(), format!("{rid}upstream_eof round={round_no}"));
                 yield serialize_event(&synthetic_incomplete(
                     base_response.as_ref(),
                     &final_output,
@@ -390,6 +419,9 @@ pub fn fold_stream_with_opener(
                     Some(&total_usage),
                 ));
                 return;
+            }
+            if let Some(reason) = stopped_reason {
+                logging::info(cfg.as_ref(), format!("{rid}stopped reason={reason} round={round_no}"));
             }
 
             for entry in &out_buffer {
@@ -749,4 +781,8 @@ fn truthy(v: &Value) -> bool {
         Value::Array(xs) => !xs.is_empty(),
         Value::Object(o) => !o.is_empty(),
     }
+}
+
+fn opt_i64(v: Option<i64>) -> String {
+    v.map_or_else(|| "none".to_string(), |v| v.to_string())
 }

@@ -1,4 +1,10 @@
-use std::{io, sync::Arc};
+use std::{
+    io,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 
 use axum::{
     body::{Body, Bytes},
@@ -15,6 +21,7 @@ use crate::{
     codex::{build_round_payload, declares_continue_tool, reasoning_enabled, repair_followup_input},
     config::Config,
     creds::{build_upstream_headers, would_inject_authorization},
+    logging,
     proxy::{collect_body, fold_stream, open_passthrough, open_round, HeaderMapStr},
     store::IdStore,
 };
@@ -24,6 +31,7 @@ pub struct AppState {
     cfg: Arc<Config>,
     client: reqwest::Client,
     id_store: Arc<IdStore>,
+    request_seq: Arc<AtomicU64>,
 }
 
 pub fn create_router(cfg: Config) -> Router {
@@ -32,6 +40,7 @@ pub fn create_router(cfg: Config) -> Router {
         cfg: Arc::new(cfg),
         client: make_client(),
         id_store: Arc::new(IdStore::default()),
+        request_seq: Arc::new(AtomicU64::new(1)),
     };
     let mut router = Router::new();
     for path in paths {
@@ -65,20 +74,33 @@ pub fn url_is_from_header(cfg: &Config, headers: &HeaderMap) -> bool {
 
 async fn handle_responses(
     State(state): State<AppState>,
-    OriginalUri(_uri): OriginalUri,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     raw: Bytes,
 ) -> Response {
     let cfg = state.cfg.clone();
+    let request_id = state.request_seq.fetch_add(1, Ordering::Relaxed);
+    logging::info(
+        cfg.as_ref(),
+        format!("request_id={request_id} path={} body_bytes={}", uri.path(), raw.len()),
+    );
     let mut body: Value = match serde_json::from_slice(&raw) {
         Ok(body) => body,
-        Err(_) => return json_error(StatusCode::BAD_REQUEST, "invalid JSON body"),
+        Err(_) => {
+            logging::warn(cfg.as_ref(), format!("request_id={request_id} invalid JSON body"));
+            return json_error(StatusCode::BAD_REQUEST, "invalid JSON body");
+        }
     };
     if !body.is_object() {
+        logging::warn(cfg.as_ref(), format!("request_id={request_id} body must be a JSON object"));
         return json_error(StatusCode::BAD_REQUEST, "body must be a JSON object");
     }
 
     let Some(url) = resolve_upstream_url(&cfg, &headers) else {
+        logging::warn(
+            cfg.as_ref(),
+            format!("request_id={request_id} missing Responses-API-Base header"),
+        );
         return json_error(
             StatusCode::BAD_REQUEST,
             "Responses-API-Base header is required (upstream mode=header_required)",
@@ -88,18 +110,31 @@ async fn handle_responses(
     if url_is_from_header(&cfg, &headers)
         && would_inject_authorization(&cfg, headers.get("authorization").is_some())
     {
+        logging::warn(
+            cfg.as_ref(),
+            format!("request_id={request_id} auth conflict with Responses-API-Base"),
+        );
         return json_error(
             StatusCode::BAD_REQUEST,
             "When overriding the upstream base (Responses-API-Base), the request must provide its own Authorization; the proxy will not send its configured credentials to an externally supplied URL.",
         );
     }
 
+    let stream_requested = truthy(body.get("stream"));
+    let reasoning_requested = reasoning_enabled(&body);
     let collision = cfg.cont.method == "tool_pair"
         && declares_continue_tool(&body, &cfg.cont.continue_tool_name);
-    let should_fold = cfg.cont.enabled && truthy(body.get("stream")) && reasoning_enabled(&body) && !collision;
+    let should_fold = cfg.cont.enabled && stream_requested && reasoning_requested && !collision;
+    logging::info(
+        cfg.as_ref(),
+        format!(
+            "request_id={request_id} stream={stream_requested} reasoning={reasoning_requested} mode={}",
+            if should_fold { "fold" } else { "passthrough" }
+        ),
+    );
 
     if !should_fold {
-        return passthrough(&state.client, &cfg, &headers, raw, &url).await;
+        return passthrough(&state.client, &cfg, &headers, raw, &url, request_id).await;
     }
 
     if cfg.cont.repair_followup == "stateful" && cfg.cont.method == "tool_pair" {
@@ -126,8 +161,20 @@ async fn handle_responses(
         false,
     );
     let first = match open_round(&state.client, &url, &payload, &upstream_headers).await {
-        Ok(resp) => resp,
-        Err(err) => return json_error(StatusCode::BAD_GATEWAY, &err),
+        Ok(resp) => {
+            logging::info(
+                cfg.as_ref(),
+                format!("request_id={request_id} upstream status={}", resp.status),
+            );
+            resp
+        }
+        Err(err) => {
+            logging::error(
+                cfg.as_ref(),
+                format!("request_id={request_id} upstream open failed: {err}"),
+            );
+            return json_error(StatusCode::BAD_GATEWAY, &err);
+        }
     };
     if first.status >= 400 {
         let status = status(first.status);
@@ -147,6 +194,7 @@ async fn handle_responses(
             first,
             state.id_store.clone(),
             url,
+            request_id,
         )),
     )
 }
@@ -157,16 +205,24 @@ async fn passthrough(
     headers: &HeaderMap,
     raw: Bytes,
     url: &str,
+    request_id: u64,
 ) -> Response {
     let upstream_headers = upstream_headers(headers, cfg);
     match open_passthrough(client, url, raw, &upstream_headers).await {
         Ok(resp) => {
+            logging::info(
+                cfg,
+                format!("request_id={request_id} upstream status={}", resp.status),
+            );
             let status = status(resp.status);
             let content_type = resp.content_type.clone();
             let stream = resp.body.map(|r| r.map_err(|e| io::Error::new(io::ErrorKind::Other, e)));
             body_response(status, content_type, Body::from_stream(stream))
         }
-        Err(err) => json_error(StatusCode::BAD_GATEWAY, &err),
+        Err(err) => {
+            logging::error(cfg, format!("request_id={request_id} upstream open failed: {err}"));
+            json_error(StatusCode::BAD_GATEWAY, &err)
+        }
     }
 }
 
