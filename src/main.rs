@@ -25,6 +25,11 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    let bound_addr = listener.local_addr().unwrap_or(addr);
+    println!("codex-cont listening on http://{bound_addr}");
+    for path in &cfg.server.listen_paths {
+        println!("  http://{bound_addr}{path}");
+    }
     if let Err(err) = axum::serve(listener, create_router(cfg)).await {
         eprintln!("server error: {err}");
     }
