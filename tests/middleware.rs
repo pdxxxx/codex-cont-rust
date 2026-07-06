@@ -3,10 +3,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use bytes::Bytes;
 use codex_cont::{
-    app::{resolve_upstream_url, url_is_from_header},
+    app::{create_router, resolve_upstream_url, url_is_from_header},
     codex::{
         continue_call_id, is_truncation_pattern, reasoning_enabled, repair_followup_input,
         should_continue, tier_n,
@@ -98,6 +98,24 @@ fn round(rs_id: &str, enc: &str, reasoning_tokens: i64, msg: Option<&str>) -> By
 
 fn typ(ev: &Value) -> &str {
     ev.get("type").and_then(Value::as_str).unwrap_or("")
+}
+
+#[tokio::test]
+async fn large_invalid_json_reaches_handler() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, create_router(Config::default())).await.unwrap();
+    });
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{addr}/v1/responses"))
+        .body(vec![b'{'; 2 * 1024 * 1024 + 1])
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[test]

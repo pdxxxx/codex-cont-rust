@@ -2,7 +2,7 @@ use std::{io, sync::Arc};
 
 use axum::{
     body::{Body, Bytes},
-    extract::{OriginalUri, State},
+    extract::{DefaultBodyLimit, OriginalUri, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
@@ -37,7 +37,7 @@ pub fn create_router(cfg: Config) -> Router {
     for path in paths {
         router = router.route(&path, post(handle_responses));
     }
-    router.with_state(state)
+    router.with_state(state).layer(DefaultBodyLimit::disable())
 }
 
 pub fn make_client() -> reqwest::Client {
