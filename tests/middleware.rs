@@ -20,8 +20,8 @@ use codex_cont::{
 use futures_util::{stream, StreamExt};
 use serde_json::{json, Value};
 
-const R1: &[u8] = include_bytes!("../../python/tests/fixtures/codex_poc_r1.sse.txt");
-const R2: &[u8] = include_bytes!("../../python/tests/fixtures/codex_poc_r2.sse.txt");
+const R1: &[u8] = include_bytes!("fixtures/codex_poc_r1.sse.txt");
+const R2: &[u8] = include_bytes!("fixtures/codex_poc_r2.sse.txt");
 
 fn make_sse(events: Vec<Value>) -> Bytes {
     let mut out = Vec::new();
