@@ -1,0 +1,38 @@
+[server]
+host = "127.0.0.1"
+port = 8787
+listen_paths = ["/v1/responses"]
+
+[upstream]
+url = "https://chatgpt.com/backend-api/codex/responses"
+mode = "header" # fixed | header | header_required
+
+[upstream.headers]
+
+[auth]
+mode = "passthrough" # passthrough | inject | passthrough_then_inject
+access_token = ""
+chatgpt_account_id = ""
+
+[continue]
+enabled = true
+truncation_step = 518
+max_continue = 3
+min_n = 1
+max_n = 6
+method = "commentary" # commentary | tool_pair
+marker_text = "Continue thinking..."
+forward_marker = false
+continue_tool_name = "continue_thinking"
+continue_output_text = "Please continue thinking about the query."
+repair_followup = "off" # off | stateful
+max_total_output_tokens = 0
+
+[stream]
+force_include_encrypted = true
+rechunk_final_answer = true
+rechunk_size = 16
+
+[log]
+level = "info"
+dump_rounds_dir = ""
