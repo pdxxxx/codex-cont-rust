@@ -1,14 +1,36 @@
 # CodexCont Rust 版
 
-Rust 版从运行目录读取 `config.toml`；文件不存在时使用内置默认配置。
+[English README](README.md) · [AI Agent 安装手册](INSTALL-GUIDE-AGENT/AGENT.md)
+
+Rust 版从运行中的 exe 同级目录读取 `config.toml`；文件不存在时使用内置默认配置。
 
 ## 运行
 
 ```powershell
 cd rust
-Copy-Item config.example.toml config.toml
-cargo run --release
+cargo build --release
+Copy-Item config.example.toml target\release\config.toml
+target\release\codex-cont.exe
 ```
+
+发布包使用时，把 `config.example.toml` 复制成与 `codex-cont.exe` 同级的 `config.toml`，再运行：
+
+```powershell
+Copy-Item config.example.toml config.toml
+.\codex-cont.exe
+```
+
+管理员 PowerShell 可安装为原生 Windows 服务：
+
+```powershell
+.\codex-cont.exe install
+.\codex-cont.exe stop
+.\codex-cont.exe start
+.\codex-cont.exe restart
+.\codex-cont.exe uninstall
+```
+
+`install` 会注册 Automatic 启动的 `CodexCont` 服务并立即启动；`service` 子命令仅供 Windows SCM 调用。
 
 把客户端的 Responses 请求发到代理监听地址，例如：
 
@@ -27,9 +49,7 @@ http://127.0.0.1:8787/v1/responses
 ## 验证
 
 ```powershell
-cd ..\python
-uv run python tests/test_middleware.py
-
-cd ..\rust
 cargo test
 ```
+
+更完整的功能、客户端接入、鉴权和限制说明见英文版 [README.md](README.md)。

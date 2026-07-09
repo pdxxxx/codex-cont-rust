@@ -28,8 +28,10 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path dist | Out-Null
+          New-Item -ItemType Directory -Path dist/INSTALL-GUIDE-AGENT | Out-Null
           Copy-Item target/release/codex-cont.exe dist/
-          Copy-Item README_zh.md, config.example.toml dist/
+          Copy-Item README.md, README_zh.md, config.example.toml dist/
+          Copy-Item INSTALL-GUIDE-AGENT/AGENT.md dist/INSTALL-GUIDE-AGENT/
           Compress-Archive -Path dist/* -DestinationPath codex-cont-windows-x64.zip -Force
 
       - name: Create GitHub Release

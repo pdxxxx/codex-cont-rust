@@ -1,4 +1,7 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Deserializer};
 
@@ -153,27 +156,39 @@ impl Default for Config {
             cont: ContinueCfg::default(),
             stream: StreamCfg::default(),
             log: LogCfg::default(),
-            root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            root: PathBuf::from("."),
         }
     }
 }
 
+pub fn config_path_for_exe(exe: impl AsRef<Path>) -> PathBuf {
+    exe.as_ref()
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join("config.toml")
+}
+
+pub fn default_config_path() -> Result<PathBuf, String> {
+    std::env::current_exe()
+        .map(config_path_for_exe)
+        .map_err(|e| format!("failed to locate current executable: {e}"))
+}
+
 pub fn load_config(path: impl Into<PathBuf>) -> Result<Config, String> {
     let path = path.into();
+    let root = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
     let mut cfg = if path.exists() {
         let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
         toml::from_str::<Config>(&text).map_err(|e| e.to_string())?
     } else {
         Config::default()
     };
-    cfg.root = if path.exists() {
-        path.canonicalize()
-            .ok()
-            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
-    } else {
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-    };
+    cfg.root = root;
     Ok(cfg)
 }
 
@@ -196,4 +211,26 @@ where
             (k, value)
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{config_path_for_exe, load_config};
+    use std::path::PathBuf;
+
+    #[test]
+    fn config_path_uses_exe_directory() {
+        let exe = PathBuf::from("bin").join("codex-cont.exe");
+        assert_eq!(
+            config_path_for_exe(&exe),
+            PathBuf::from("bin").join("config.toml")
+        );
+    }
+
+    #[test]
+    fn missing_config_root_is_config_directory() {
+        let path = PathBuf::from("missing-bin").join("config.toml");
+        let cfg = load_config(path).unwrap();
+        assert_eq!(cfg.root, PathBuf::from("missing-bin"));
+    }
 }
