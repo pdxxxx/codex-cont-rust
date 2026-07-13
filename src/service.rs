@@ -21,12 +21,16 @@ mod imp {
 
     const SERVICE_NAME: &str = "CodexCont";
     const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
+    // ERROR_SERVICE_EXISTS
+    const ERROR_SERVICE_EXISTS: i32 = 1073;
+    // ERROR_SERVICE_DOES_NOT_EXIST
+    const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
 
     define_windows_service!(ffi_service_main, service_main);
 
     pub fn run() -> Result<(), String> {
         service_dispatcher::start(SERVICE_NAME, ffi_service_main)
-            .map_err(|e| format!("failed to start service dispatcher: {e}"))
+            .map_err(|e| format!("failed to start service dispatcher: {}", winerr(e)))
     }
 
     fn service_main(_arguments: Vec<OsString>) {
@@ -53,13 +57,13 @@ mod imp {
         };
 
         let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)
-            .map_err(|e| format!("failed to register service control handler: {e}"))?;
+            .map_err(|e| format!("failed to register service control handler: {}", winerr(e)))?;
         status_handle
             .set_service_status(status(
                 ServiceState::StartPending,
                 ServiceControlAccept::empty(),
             ))
-            .map_err(|e| format!("failed to report service status: {e}"))?;
+            .map_err(|e| format!("failed to report service status: {}", winerr(e)))?;
 
         let result = crate::block_on_server(
             async move {
@@ -68,68 +72,72 @@ mod imp {
             || {
                 status_handle
                     .set_service_status(status(ServiceState::Running, ServiceControlAccept::STOP))
-                    .map_err(|e| format!("failed to report service status: {e}"))
+                    .map_err(|e| format!("failed to report service status: {}", winerr(e)))
             },
         );
         status_handle
             .set_service_status(status(ServiceState::Stopped, ServiceControlAccept::empty()))
-            .map_err(|e| format!("failed to report stopped service status: {e}"))?;
+            .map_err(|e| format!("failed to report stopped service status: {}", winerr(e)))?;
         result
     }
 
     pub fn install() -> Result<(), String> {
         let manager =
             manager(ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
-        let service_info = ServiceInfo {
-            name: OsString::from(SERVICE_NAME),
-            display_name: OsString::from(SERVICE_NAME),
-            service_type: SERVICE_TYPE,
-            start_type: ServiceStartType::AutoStart,
-            error_control: ServiceErrorControl::Normal,
-            executable_path: std::env::current_exe()
-                .map_err(|e| format!("failed to locate current executable: {e}"))?,
-            launch_arguments: vec![OsString::from("service")],
-            dependencies: vec![],
-            account_name: None,
-            account_password: None,
+        let service_info = service_info()?;
+        let service = match manager.create_service(
+            &service_info,
+            ServiceAccess::QUERY_STATUS
+                | ServiceAccess::START
+                | ServiceAccess::STOP
+                | ServiceAccess::CHANGE_CONFIG,
+        ) {
+            Ok(service) => service,
+            Err(err) if win_code(&err) == Some(ERROR_SERVICE_EXISTS) => {
+                let service = manager
+                    .open_service(
+                        SERVICE_NAME,
+                        ServiceAccess::QUERY_STATUS
+                            | ServiceAccess::START
+                            | ServiceAccess::STOP
+                            | ServiceAccess::CHANGE_CONFIG,
+                    )
+                    .map_err(|e| format!("failed to open {SERVICE_NAME} service: {}", winerr(e)))?;
+                // Keep binary path/start type current when re-running install.
+                service
+                    .change_config(&service_info)
+                    .map_err(|e| format!("failed to update {SERVICE_NAME} service: {}", winerr(e)))?;
+                service
+            }
+            Err(err) => {
+                return Err(format!(
+                    "failed to create {SERVICE_NAME} service: {}",
+                    winerr(err)
+                ))
+            }
         };
-        let service = manager
-            .create_service(
-                &service_info,
-                ServiceAccess::QUERY_STATUS | ServiceAccess::START,
-            )
-            .map_err(|e| format!("failed to create {SERVICE_NAME} service: {e}"))?;
-        service
-            .start::<&str>(&[])
-            .map_err(|e| format!("failed to start {SERVICE_NAME} service: {e}"))?;
-        wait_for_state(&service, ServiceState::Running)
+        ensure_running(&service)
     }
 
     pub fn uninstall() -> Result<(), String> {
-        let service =
-            open(ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE)?;
+        let service = match open(
+            ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE,
+        ) {
+            Ok(service) => service,
+            Err(err) if win_code_from_msg(&err) == Some(ERROR_SERVICE_DOES_NOT_EXIST) => {
+                return Ok(())
+            }
+            Err(err) => return Err(err),
+        };
         stop_if_needed(&service)?;
         service
             .delete()
-            .map_err(|e| format!("failed to delete {SERVICE_NAME} service: {e}"))
+            .map_err(|e| format!("failed to delete {SERVICE_NAME} service: {}", winerr(e)))
     }
 
     pub fn start() -> Result<(), String> {
         let service = open(ServiceAccess::QUERY_STATUS | ServiceAccess::START)?;
-        match service
-            .query_status()
-            .map_err(|e| e.to_string())?
-            .current_state
-        {
-            ServiceState::Running => return Ok(()),
-            ServiceState::StartPending => return wait_for_state(&service, ServiceState::Running),
-            ServiceState::StopPending => wait_for_state(&service, ServiceState::Stopped)?,
-            _ => {}
-        }
-        service
-            .start::<&str>(&[])
-            .map_err(|e| format!("failed to start {SERVICE_NAME} service: {e}"))?;
-        wait_for_state(&service, ServiceState::Running)
+        ensure_running(&service)
     }
 
     pub fn stop() -> Result<(), String> {
@@ -142,20 +150,54 @@ mod imp {
         start()
     }
 
+    fn service_info() -> Result<ServiceInfo, String> {
+        Ok(ServiceInfo {
+            name: OsString::from(SERVICE_NAME),
+            display_name: OsString::from(SERVICE_NAME),
+            service_type: SERVICE_TYPE,
+            start_type: ServiceStartType::AutoStart,
+            error_control: ServiceErrorControl::Normal,
+            executable_path: std::env::current_exe()
+                .map_err(|e| format!("failed to locate current executable: {e}"))?,
+            launch_arguments: vec![OsString::from("service")],
+            dependencies: vec![],
+            account_name: None,
+            account_password: None,
+        })
+    }
+
     fn manager(access: ServiceManagerAccess) -> Result<ServiceManager, String> {
-        ServiceManager::local_computer(None::<&str>, access).map_err(|e| e.to_string())
+        ServiceManager::local_computer(None::<&str>, access)
+            .map_err(|e| format!("failed to open service manager: {}", winerr(e)))
     }
 
     fn open(access: ServiceAccess) -> Result<Service, String> {
         manager(ServiceManagerAccess::CONNECT)?
             .open_service(SERVICE_NAME, access)
-            .map_err(|e| format!("failed to open {SERVICE_NAME} service: {e}"))
+            .map_err(|e| format!("failed to open {SERVICE_NAME} service: {}", winerr(e)))
+    }
+
+    fn ensure_running(service: &Service) -> Result<(), String> {
+        match service
+            .query_status()
+            .map_err(|e| format!("failed to query {SERVICE_NAME} service: {}", winerr(e)))?
+            .current_state
+        {
+            ServiceState::Running => return Ok(()),
+            ServiceState::StartPending => return wait_for_state(service, ServiceState::Running),
+            ServiceState::StopPending => wait_for_state(service, ServiceState::Stopped)?,
+            _ => {}
+        }
+        service
+            .start::<&str>(&[])
+            .map_err(|e| format!("failed to start {SERVICE_NAME} service: {}", winerr(e)))?;
+        wait_for_state(service, ServiceState::Running)
     }
 
     fn stop_if_needed(service: &Service) -> Result<(), String> {
         match service
             .query_status()
-            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("failed to query {SERVICE_NAME} service: {}", winerr(e)))?
             .current_state
         {
             ServiceState::Stopped => return Ok(()),
@@ -164,7 +206,7 @@ mod imp {
         }
         service
             .stop()
-            .map_err(|e| format!("failed to stop {SERVICE_NAME} service: {e}"))?;
+            .map_err(|e| format!("failed to stop {SERVICE_NAME} service: {}", winerr(e)))?;
         wait_for_state(service, ServiceState::Stopped)
     }
 
@@ -172,7 +214,7 @@ mod imp {
         for _ in 0..50 {
             let state = service
                 .query_status()
-                .map_err(|e| format!("failed to query {SERVICE_NAME} service: {e}"))?
+                .map_err(|e| format!("failed to query {SERVICE_NAME} service: {}", winerr(e)))?
                 .current_state;
             if state == target {
                 return Ok(());
@@ -180,6 +222,29 @@ mod imp {
             thread::sleep(Duration::from_millis(200));
         }
         Err(format!("{SERVICE_NAME} service did not reach {target:?}"))
+    }
+
+    fn winerr(err: windows_service::Error) -> String {
+        match err {
+            windows_service::Error::Winapi(io) => match io.raw_os_error() {
+                Some(code) => format!("{io} (win32={code})"),
+                None => io.to_string(),
+            },
+            other => other.to_string(),
+        }
+    }
+
+    fn win_code(err: &windows_service::Error) -> Option<i32> {
+        match err {
+            windows_service::Error::Winapi(io) => io.raw_os_error(),
+            _ => None,
+        }
+    }
+
+    // open() already formats with winerr(); peel code from that string as last resort.
+    fn win_code_from_msg(msg: &str) -> Option<i32> {
+        msg.rsplit_once("win32=")
+            .and_then(|(_, code)| code.trim_end_matches(')').parse().ok())
     }
 
     fn status(
